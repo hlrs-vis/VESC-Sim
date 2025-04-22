@@ -4,7 +4,7 @@
 #include <U8g2lib.h> //display library
 #include <cmath>
 #include "CyclingDynamics.h"
-
+#include <vector>
 
 /** Initiate VescUart class */
 VescUart UART;
@@ -24,9 +24,11 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
     double Crr = 0.0033; // Rollwiderstandskoeffizient
     double slope = 0.0; // Steigung in %
     const double g = 9.81; // Erdbeschleunigung in m/s^2
-    double number_poles = 14;
-    double gear_ratio = 3.6;
+    double number_poles = 18.0;
+    double gear_ratio = 2.8;
     double wheel_diameter = 0.622; // 622 mm
+    double chainring = 48.0;
+    double sprocket = 11.0;
     CyclingDynamics cd(mass, CdA, Crr, number_poles, gear_ratio, wheel_diameter);
 
 
@@ -64,10 +66,64 @@ unsigned long currentTime = millis();
 unsigned long newTime = millis();
 unsigned long lastTime = millis();
 unsigned long deltaT = 0;
+double newTimeMinutes = 0.0;
 double max_rpm = 20000.0;
 double threshold_rpm = 500;
 bool rpm_control = false;
 bool verbose = true;
+
+struct Protocol {
+    double time;
+    double cadence;
+};
+
+  std::vector<Protocol> cadenceTable = {
+      {0, 90},
+      {2, 90},   // From start to 6 min free warmup
+      {4, 60},   // 2 minutes at 60 RPM, target 50W
+      {6, 70},  // 2 minutes at 70 RPM
+      {8, 80}, // 2 minutes at 80 RPM
+      {10, 0}, // 3 minutes free cycling
+      {12, 60}, // 2 minutes at 60 RPM, target 100W
+      {14, 70}, // 2 minutes at 70 RPM
+      {16, 80}, // 2 minutes at 80 RPM
+      {18, 0}, // 3 minutes free cycling
+      {20, 60}, // 2 minutes at 60 RPM, target 150W
+      {22, 70}, // 2 minutes at 70 RPM
+      {24, 80}, // 2 minutes at 80 RPM
+      {26, 0}, // 3 minutes free cycling
+      {28, 60}, // 2 minutes at 60 RPM, target 200W
+      {30, 70}, // 2 minutes at 70 RPM
+      {32, 80}, // 2 minutes at 80 RPM
+      {34, 0} // 6 minutes free cycling
+  };
+
+double getCadenceAtTime(double queryTime, const std::vector<Protocol>& table) {
+    if (table.empty()) {
+        return 0.0;  // Return 0 if the table is empty
+    }
+
+    // If the query time is before the first entry, return the first cadence
+    if (queryTime <= table.front().time) {
+        return table.front().cadence;
+    }
+
+    // If the query time is after the last entry, return the last cadence
+    if (queryTime >= table.back().time) {
+        return table.back().cadence;
+    }
+
+    // Find the two closest time points
+    for (size_t i = 0; i < table.size() - 1; ++i) {
+        if (queryTime >= table[i].time && queryTime <= table[i + 1].time) {
+            double c2 = table[i + 1].cadence;
+            return c2;
+        }
+    }
+
+    return 0.0;  // Fallback (should never reach here)
+}
+
 
 void loop() {
   i=i+1;
@@ -80,6 +136,20 @@ void loop() {
   newTime = millis();
   deltaT =  newTime - lastTime;
   lastTime = newTime;
+  newTimeMinutes = newTime / 60000.0;
+  Serial.print("newTimeMinutes: ");
+  Serial.print((int)newTimeMinutes);
+  Serial.print(":");
+  Serial.print((int)(newTimeMinutes * 60) % 60);
+  Serial.print("    ");
+
+  double target_cadence = getCadenceAtTime(newTimeMinutes, cadenceTable);
+  double new_rpm_value = target_cadence * gear_ratio * number_poles * chainring / sprocket ;
+
+  if (new_rpm_value > max_rpm) 
+  {
+    new_rpm_value = max_rpm;
+  }
 
   //Serial.println("Waiting started");
   //delay(10);
@@ -101,8 +171,9 @@ void loop() {
     if (UART.data.rpm < threshold_rpm) 
     {
       UART.setBrakeCurrent(0.0);
+      rpm_control = false;
     } 
-    else if (UART.data.rpm >= threshold_rpm) 
+    else if (UART.data.rpm >= threshold_rpm && new_rpm_value > 0) 
     { 
       if (!rpm_control) 
       {
@@ -111,53 +182,13 @@ void loop() {
       }
       else
       {
-        velocity = cd.speed(UART.data.rpm);
-
-        BikeForces forces = cd.calculateForces(velocity, slope);
-        if (verbose)
-        {
-          Serial.print("Speed: ");
-          Serial.print(velocity);
-          /*Serial.print("Luft: ");
-          Serial.print(forces.airResistance);
-          Serial.print(" N, ");
-          Serial.print("Roll: ");
-          Serial.print(forces.rollingResistance);
-          Serial.print(" N, ");
-          Serial.print("Steigung: ");
-          Serial.print(forces.slopeForce);
-          Serial.print(" N, ");*/
-          Serial.print("Gesamtkraft: ");
-          Serial.print(forces.totalForce);
-          Serial.print(" N");
-        }
-        double propulsive_force = - UART.data.avgInputCurrent * UART.data.inpVoltage / velocity;
-
-        double acceleration = (propulsive_force - forces.totalForce) / mass;
-
-        double new_velocity =  velocity + acceleration * deltaT/1000;
-        double new_rpm_value = cd.new_rpm(new_velocity);
-        if (verbose)
-        { 
-          Serial.print("propulsF: ");
-          Serial.print(propulsive_force);
-          Serial.print("Acc: ");
-          Serial.print(acceleration);
-        }
-        double delta_rpms = new_rpm_value - UART.data.rpm;
-
-        if (new_rpm_value > max_rpm) 
-        {
-          new_rpm_value = max_rpm;
-        }
         if (verbose)
         {
           Serial.print("newRPM: ");
           Serial.print(new_rpm_value);
 
           u8g2.drawStr(0,20,("RPM" + String(UART.data.rpm)).c_str());
-          u8g2.drawStr(0,30,("deltaRPM" + String(delta_rpms)).c_str());
-          u8g2.drawStr(0,10,("Input Volt." + String(UART.data.inpVoltage)).c_str());
+          u8g2.drawStr(0,10,("Target Cad" + String(target_cadence)).c_str());
           u8g2.drawStr(0,40,("target rpm " + String(new_rpm_value)).c_str());
           u8g2.drawStr(0,50,("Inp. Curr." + String(UART.data.avgInputCurrent)).c_str());
         }
